@@ -9,6 +9,9 @@ from config import (
 )
 from utils.helper import format_undefined_object_output
 from utils.logger import log
+from utils.preprocessing import (
+    enhance_image, compute_match_confidence, verify_homography
+)
 
 
 class ImageMatcher:
@@ -138,8 +141,12 @@ class ImageMatcher:
         """SuperPoint + LightGlue ile referans objeyi ana karede arar."""
         from lightglue.utils import rbd
 
-        img0 = self._to_tensor(ref_img)
-        img1 = self._to_tensor(frame)
+        # Ön işleme: CLAHE ile kontrast iyileştirmesi
+        ref_enhanced = enhance_image(ref_img)
+        frame_enhanced = enhance_image(frame)
+
+        img0 = self._to_tensor(ref_enhanced)
+        img1 = self._to_tensor(frame_enhanced)
 
         with torch.inference_mode():
             feats0 = self.extractor.extract(img0)
@@ -158,6 +165,18 @@ class ImageMatcher:
         H, mask = cv2.findHomography(m_kpts0, m_kpts1, cv2.RANSAC, 5.0)
         if H is None:
             return None, None
+
+        # Geometrik doğrulama: Saçma homografileri reddet
+        if not verify_homography(H, ref_img.shape):
+            log.debug("Homografi geometrik doğrulamadan geçemedi, atlanıyor.")
+            return None, None
+
+        # Güven skoru hesapla
+        confidence = compute_match_confidence(matches, m_kpts0, m_kpts1, mask)
+        if confidence < 0.25:
+            log.debug(f"Eşleşme güven skoru çok düşük: {confidence:.3f}, atlanıyor.")
+            return None, None
+        log.debug(f"Eşleşme güven skoru: {confidence:.3f}")
 
         # Referans görüntünün köşelerini ana kareye yansıt
         h, w = ref_img.shape[:2]
@@ -211,23 +230,33 @@ class ImageMatcher:
         """
         MobileSAM ile eşleşen noktalardan piksel düzeyinde maske çıkarır.
         Maskeden elde edilen kutu, LightGlue kutusundan çok daha hassastır.
+        
+        Strateji: Hem nokta hem de kutu promptu birlikte verilir.
+        - Nokta promptları: "Obje buralarda" ipucu
+        - Kutu promptu: "Obje kabaca bu alanda" ipucu
+        Bu ikisinin birleşimi, tek başına noktadan çok daha isabetli maske çıkarır.
         """
         try:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             self.sam_predictor.set_image(frame_rgb)
 
-            # En fazla 64 nokta ver (SAM'in performansı için yeterli)
-            if len(match_points) > 64:
-                indices = np.random.choice(len(match_points), 64, replace=False)
+            # En fazla 32 nokta ver (çok fazla nokta SAM'ı yanıltabilir)
+            if len(match_points) > 32:
+                indices = np.random.choice(len(match_points), 32, replace=False)
                 input_points = match_points[indices]
             else:
                 input_points = match_points
 
             input_labels = np.ones(len(input_points))  # Hepsi pozitif (objenin içi)
 
+            # Kutu promptu: LightGlue'nun bulduğu kabataslak kutuyu SAM'a ver
+            input_box = np.array([fallback_bbox[0], fallback_bbox[1], 
+                                  fallback_bbox[2], fallback_bbox[3]])
+
             masks, scores, _ = self.sam_predictor.predict(
                 point_coords=input_points,
                 point_labels=input_labels,
+                box=input_box,
                 multimask_output=True,
             )
 
