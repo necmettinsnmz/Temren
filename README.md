@@ -3,9 +3,9 @@
 Bu proje, 2026 Teknofest Havacılıkta Yapay Zeka yarışması için hazırlanan taslak mimaridir. Takım üyelerinin görevleri ayrı modüllerde geliştirmesine ve `main.py` üzerinden kolayca sunucuya entegre etmesine olanak tanır.
 
 ## Görev Dağılımı
-- **Görev 1 (Nesne Tespiti):** `tasks/task1_detection.py` (Arkadaşınız 1)
-- **Görev 2 (Pozisyon Tespiti):** `tasks/task2_position.py` (Arkadaşınız 2)
-- **Görev 3 (Görüntü Eşleme):** `tasks/task3_matching.py` (Sizin göreviniz)
+- **Görev 1 (Nesne Tespiti):** `tasks/task1_detection.py`
+- **Görev 2 (Pozisyon Kestirimi):** `tasks/task2_position.py`
+- **Görev 3 (Görüntü Eşleme):** `tasks/task3_matching.py`
 
 ## Kurulum
 1. `pip install -r requirements.txt` ile bağımlılıkları yükleyin.

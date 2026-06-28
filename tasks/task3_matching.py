@@ -1,194 +1,320 @@
 import cv2
 import numpy as np
 import torch
+import os
+from config import (
+    LIGHTGLUE_MAX_KEYPOINTS, LIGHTGLUE_MIN_MATCHES,
+    MOBILESAM_MODEL_PATH, USE_SAM_REFINEMENT,
+    TRACKER_REDETECTION_INTERVAL
+)
 from utils.helper import format_undefined_object_output
 from utils.logger import log
 
+
 class ImageMatcher:
+    """
+    Görüntü Eşleme modülü.
+    
+    Pipeline:
+    1. SuperPoint + LightGlue ile referans objeyi ana karede bul (feature matching).
+    2. MobileSAM ile eşleşen bölgenin piksel düzeyinde maskesini çıkar ve kutuyu iyileştir.
+    3. CSRT Tracker ile ara karelerde hızlıca takip et, belirli aralıklarla LightGlue ile doğrula.
+    """
+
     def __init__(self):
-        log.info("Görev 3 (Görüntü Eşleme ve Takip) modülü başlatıldı.")
+        log.info("Görev 3 (Görüntü Eşleme) modülü başlatılıyor...")
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         log.info(f"Cihaz: {self.device}")
-        
-        # Takipçi (Tracker) sözlüğü: Her objenin ID'sine karşılık gelen aktif tracker'ı tutar.
+
+        # Takipçi (Tracker) durumları
         self.trackers = {}
         self.frame_count = 0
-        self.detection_interval = 15  # Her 15 karede bir LightGlue ile doğrulama (Re-detection)
-        
+
+        # --- LightGlue Yükleme ---
         try:
             from lightglue import LightGlue, SuperPoint
-            self.extractor = SuperPoint(max_num_keypoints=2048).eval().to(self.device)
+            self.extractor = SuperPoint(max_num_keypoints=LIGHTGLUE_MAX_KEYPOINTS).eval().to(self.device)
             self.matcher = LightGlue(features='superpoint').eval().to(self.device)
             self.use_lightglue = True
-            log.info("Orijinal SuperPoint + LightGlue modeli başarıyla yüklendi.")
+            log.info("SuperPoint + LightGlue yüklendi.")
         except ImportError:
-            log.warning("LightGlue bulunamadı, OpenCV SIFT yöntemine düşülüyor.")
+            log.warning("LightGlue bulunamadı, OpenCV SIFT fallback aktif.")
             self.sift = cv2.SIFT_create()
             self.bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
             self.use_lightglue = False
 
+        # --- MobileSAM Yükleme ---
+        self.use_sam = False
+        if USE_SAM_REFINEMENT and os.path.exists(MOBILESAM_MODEL_PATH):
+            try:
+                from mobile_sam import sam_model_registry, SamPredictor
+                sam = sam_model_registry["vit_t"](checkpoint=MOBILESAM_MODEL_PATH).to(self.device)
+                sam.eval()
+                self.sam_predictor = SamPredictor(sam)
+                self.use_sam = True
+                log.info("MobileSAM yüklendi. Kutu iyileştirme (refinement) aktif.")
+            except ImportError:
+                log.warning("MobileSAM kütüphanesi bulunamadı. Kutu iyileştirme devre dışı.")
+            except Exception as e:
+                log.warning(f"MobileSAM yüklenirken hata: {e}. Kutu iyileştirme devre dışı.")
+        elif USE_SAM_REFINEMENT:
+            log.warning(f"MobileSAM ağırlık dosyası bulunamadı: {MOBILESAM_MODEL_PATH}")
+
+        log.info("Görev 3 modülü hazır.")
+
+    # =========================================================================
+    # ANA ÇALIŞMA DÖNGÜSÜ
+    # =========================================================================
     def run(self, frame, reference_objects=None, **kwargs):
         """
-        frame: Ana görüntü (Numpy array)
-        reference_objects: Aranacak referans objelerin listesi. Örn: [{"id": 1, "image": ref_img_numpy}]
+        Her frame için çağrılır.
+        
+        Args:
+            frame: Ana görüntü (numpy array, BGR).
+            reference_objects: [{"id": int, "image": numpy_array}, ...] formatında referans objeler.
+        
+        Returns:
+            Eşleşen objelerin listesi (şartname JSON formatında).
         """
         matched_objects = []
         self.frame_count += 1
 
         if not reference_objects:
-            log.debug("Referans obje listesi boş, eşleştirme atlanıyor.")
             return matched_objects
-            
+
         try:
             for ref_obj in reference_objects:
                 obj_id = ref_obj["id"]
                 ref_img = ref_obj["image"]
-                
-                # Eğer objeyi şu an takip etmiyorsak VEYA doğrulama (detection_interval) zamanı geldiyse
-                if obj_id not in self.trackers or self.frame_count % self.detection_interval == 0:
-                    log.debug(f"[{obj_id}] için LightGlue tespit algoritması çalıştırılıyor...")
-                    if self.use_lightglue:
-                        bbox = self._match_lightglue(frame, ref_img)
-                    else:
-                        bbox = self._match_sift(frame, ref_img)
-                    
+
+                needs_detection = (
+                    obj_id not in self.trackers or
+                    self.frame_count % TRACKER_REDETECTION_INTERVAL == 0
+                )
+
+                if needs_detection:
+                    bbox, match_points = self._detect(frame, ref_img)
+
                     if bbox is not None:
-                        # Yeni Tracker başlat (CSRT daha yavaştır ama çok kesindir. KCF hızlıdır ama çabuk kaybeder)
-                        # Yarışma formatında hassasiyet önemli olduğu için CSRT kullanıyoruz.
-                        tracker = cv2.TrackerCSRT_create()
-                        x, y, w, h = bbox[0], bbox[1], bbox[2]-bbox[0], bbox[3]-bbox[1]
-                        tracker.init(frame, (x, y, w, h))
-                        self.trackers[obj_id] = tracker
-                        
-                        matched_obj = format_undefined_object_output(
-                            obj_id=obj_id,
-                            top_left_x=bbox[0],
-                            top_left_y=bbox[1],
-                            bottom_right_x=bbox[2],
-                            bottom_right_y=bbox[3]
-                        )
-                        matched_objects.append(matched_obj)
-                        log.info(f"Referans Obje {obj_id} LightGlue ile bulundu ve takibe alındı.")
+                        # MobileSAM ile kutuyu iyileştir
+                        if self.use_sam and match_points is not None:
+                            refined_bbox = self._refine_with_sam(frame, match_points, bbox)
+                            if refined_bbox is not None:
+                                bbox = refined_bbox
+
+                        # Tracker başlat
+                        self._init_tracker(obj_id, frame, bbox)
+
+                        matched_objects.append(self._format_bbox(obj_id, bbox))
+                        log.info(f"Obje {obj_id} tespit edildi ve takibe alındı. BBox: {bbox}")
                     else:
-                        log.debug(f"Referans Obje {obj_id} bulunamadı.")
-                        if obj_id in self.trackers:
-                            del self.trackers[obj_id] # Bulunamadıysa takibi de bırak
+                        log.debug(f"Obje {obj_id} bu karede bulunamadı.")
+                        self.trackers.pop(obj_id, None)
                 else:
-                    # Obje zaten takip ediliyorsa, ağır olan LightGlue yerine süper hızlı CSRT tracker'ı güncelle
-                    success, bbox_tracker = self.trackers[obj_id].update(frame)
-                    
-                    if success:
-                        x, y, w, h = [int(v) for v in bbox_tracker]
-                        matched_obj = format_undefined_object_output(
-                            obj_id=obj_id,
-                            top_left_x=x,
-                            top_left_y=y,
-                            bottom_right_x=x+w,
-                            bottom_right_y=y+h
-                        )
-                        matched_objects.append(matched_obj)
-                        log.debug(f"Referans Obje {obj_id} Tracker ile takip ediliyor.")
+                    # Tracker ile takip et
+                    tracked_bbox = self._track(obj_id, frame)
+                    if tracked_bbox is not None:
+                        matched_objects.append(self._format_bbox(obj_id, tracked_bbox))
                     else:
-                        log.warning(f"Referans Obje {obj_id} takibi kaybedildi. Bir sonraki karede LightGlue ile tekrar aranacak.")
-                        del self.trackers[obj_id]
-                        
+                        log.warning(f"Obje {obj_id} takibi kaybedildi, sonraki karede tekrar aranacak.")
+
         except Exception as e:
-            log.error(f"Görev 3 çalışırken hata: {e}")
-            
+            log.error(f"Görev 3 çalışırken hata: {e}", exc_info=True)
+
         return matched_objects
 
-    def _numpy_image_to_tensor(self, img):
-        if len(img.shape) == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-        elif len(img.shape) == 3 and img.shape[2] == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        tensor = torch.from_numpy(img).float() / 255.0
-        tensor = tensor.permute(2, 0, 1)
-        return tensor
+    # =========================================================================
+    # TESPİT (DETECTION) KATMANI
+    # =========================================================================
+    def _detect(self, frame, ref_img):
+        """LightGlue veya SIFT ile eşleştirme yapar. bbox ve eşleşen noktaları döndürür."""
+        if self.use_lightglue:
+            return self._match_lightglue(frame, ref_img)
+        else:
+            bbox = self._match_sift(frame, ref_img)
+            return bbox, None
 
     def _match_lightglue(self, frame, ref_img):
+        """SuperPoint + LightGlue ile referans objeyi ana karede arar."""
         from lightglue.utils import rbd
-        
-        img0 = self._numpy_image_to_tensor(ref_img).to(self.device)
-        img1 = self._numpy_image_to_tensor(frame).to(self.device)
-        
+
+        img0 = self._to_tensor(ref_img)
+        img1 = self._to_tensor(frame)
+
         with torch.inference_mode():
             feats0 = self.extractor.extract(img0)
             feats1 = self.extractor.extract(img1)
             matches01 = self.matcher({"image0": feats0, "image1": feats1})
-            
+
         feats0, feats1, matches01 = [rbd(x) for x in [feats0, feats1, matches01]]
         matches = matches01['matches']
-        
-        if len(matches) < 4:
-            return None
-            
+
+        if len(matches) < LIGHTGLUE_MIN_MATCHES:
+            return None, None
+
         m_kpts0 = feats0['keypoints'][matches[..., 0]].cpu().numpy()
         m_kpts1 = feats1['keypoints'][matches[..., 1]].cpu().numpy()
-        
+
         H, mask = cv2.findHomography(m_kpts0, m_kpts1, cv2.RANSAC, 5.0)
-        
         if H is None:
-            return None
-            
+            return None, None
+
+        # Referans görüntünün köşelerini ana kareye yansıt
         h, w = ref_img.shape[:2]
         corners = np.float32([[0, 0], [0, h-1], [w-1, h-1], [w-1, 0]]).reshape(-1, 1, 2)
-        transformed_corners = cv2.perspectiveTransform(corners, H)
-        
-        x_coords = transformed_corners[:, 0, 0]
-        y_coords = transformed_corners[:, 0, 1]
-        
-        frame_h, frame_w = frame.shape[:2]
-        tl_x = max(0, min(x_coords))
-        tl_y = max(0, min(y_coords))
-        br_x = min(frame_w, max(x_coords))
-        br_y = min(frame_h, max(y_coords))
-        
-        if (br_x - tl_x) < 10 or (br_y - tl_y) < 10:
-            return None
-            
-        return (tl_x, tl_y, br_x, br_y)
+        transformed = cv2.perspectiveTransform(corners, H)
+
+        bbox = self._corners_to_bbox(transformed, frame.shape)
+        if bbox is None:
+            return None, None
+
+        # Inlier eşleşme noktalarını SAM için sakla
+        inlier_mask = mask.ravel().astype(bool) if mask is not None else np.ones(len(m_kpts1), dtype=bool)
+        inlier_points = m_kpts1[inlier_mask]
+
+        return bbox, inlier_points
 
     def _match_sift(self, frame, ref_img):
-        # SIFT Fallback code unchanged
+        """OpenCV SIFT fallback."""
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
         gray_ref = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY) if len(ref_img.shape) == 3 else ref_img
-        
+
         kp1, des1 = self.sift.detectAndCompute(gray_ref, None)
         kp2, des2 = self.sift.detectAndCompute(gray_frame, None)
-        
+
         if des1 is None or des2 is None:
             return None
-            
+
         matches = self.bf.match(des1, des2)
-        matches = sorted(matches, key=lambda x: x.distance)
-        good_matches = matches[:50]
-        
-        if len(good_matches) < 4:
+        matches = sorted(matches, key=lambda x: x.distance)[:50]
+
+        if len(matches) < LIGHTGLUE_MIN_MATCHES:
             return None
-            
-        src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        
+
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
         H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
         if H is None:
             return None
-            
+
         h, w = ref_img.shape[:2]
         corners = np.float32([[0, 0], [0, h-1], [w-1, h-1], [w-1, 0]]).reshape(-1, 1, 2)
-        transformed_corners = cv2.perspectiveTransform(corners, H)
-        
-        x_coords = transformed_corners[:, 0, 0]
-        y_coords = transformed_corners[:, 0, 1]
-        
-        frame_h, frame_w = frame.shape[:2]
-        tl_x = max(0, min(x_coords))
-        tl_y = max(0, min(y_coords))
-        br_x = min(frame_w, max(x_coords))
-        br_y = min(frame_h, max(y_coords))
-        
+        transformed = cv2.perspectiveTransform(corners, H)
+
+        return self._corners_to_bbox(transformed, frame.shape)
+
+    # =========================================================================
+    # SAM İYİLEŞTİRME (REFINEMENT) KATMANI
+    # =========================================================================
+    def _refine_with_sam(self, frame, match_points, fallback_bbox):
+        """
+        MobileSAM ile eşleşen noktalardan piksel düzeyinde maske çıkarır.
+        Maskeden elde edilen kutu, LightGlue kutusundan çok daha hassastır.
+        """
+        try:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self.sam_predictor.set_image(frame_rgb)
+
+            # En fazla 64 nokta ver (SAM'in performansı için yeterli)
+            if len(match_points) > 64:
+                indices = np.random.choice(len(match_points), 64, replace=False)
+                input_points = match_points[indices]
+            else:
+                input_points = match_points
+
+            input_labels = np.ones(len(input_points))  # Hepsi pozitif (objenin içi)
+
+            masks, scores, _ = self.sam_predictor.predict(
+                point_coords=input_points,
+                point_labels=input_labels,
+                multimask_output=True,
+            )
+
+            # En yüksek skorlu maskeyi seç
+            best_idx = np.argmax(scores)
+            mask = masks[best_idx]
+
+            y_indices, x_indices = np.where(mask > 0)
+            if len(x_indices) == 0:
+                return None
+
+            frame_h, frame_w = frame.shape[:2]
+            tl_x = max(0, int(np.min(x_indices)))
+            tl_y = max(0, int(np.min(y_indices)))
+            br_x = min(frame_w, int(np.max(x_indices)))
+            br_y = min(frame_h, int(np.max(y_indices)))
+
+            if (br_x - tl_x) < 10 or (br_y - tl_y) < 10:
+                return None
+
+            log.debug(f"SAM refinement: {fallback_bbox} -> ({tl_x}, {tl_y}, {br_x}, {br_y})")
+            return (tl_x, tl_y, br_x, br_y)
+
+        except Exception as e:
+            log.warning(f"SAM iyileştirme başarısız: {e}. Orijinal kutu kullanılıyor.")
+            return None
+
+    # =========================================================================
+    # TAKİP (TRACKING) KATMANI
+    # =========================================================================
+    def _init_tracker(self, obj_id, frame, bbox):
+        """Yeni bir CSRT tracker başlatır."""
+        tracker = cv2.TrackerCSRT_create()
+        x, y = int(bbox[0]), int(bbox[1])
+        w, h = int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])
+        tracker.init(frame, (x, y, w, h))
+        self.trackers[obj_id] = tracker
+
+    def _track(self, obj_id, frame):
+        """Mevcut tracker'ı günceller ve bbox döndürür."""
+        if obj_id not in self.trackers:
+            return None
+
+        success, bbox_tracker = self.trackers[obj_id].update(frame)
+        if success:
+            x, y, w, h = [int(v) for v in bbox_tracker]
+            return (x, y, x + w, y + h)
+        else:
+            del self.trackers[obj_id]
+            return None
+
+    # =========================================================================
+    # YARDIMCI FONKSİYONLAR
+    # =========================================================================
+    def _to_tensor(self, img):
+        """Numpy BGR görüntüyü LightGlue'nun beklediği (C, H, W) RGB float32 tensöre çevirir."""
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif len(img.shape) == 3 and img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        tensor = torch.from_numpy(img).float() / 255.0
+        tensor = tensor.permute(2, 0, 1)
+        return tensor.to(self.device)
+
+    def _corners_to_bbox(self, corners, frame_shape):
+        """Perspektif dönüşümünden gelen köşe noktalarını (tl_x, tl_y, br_x, br_y) bbox'a çevirir."""
+        x_coords = corners[:, 0, 0]
+        y_coords = corners[:, 0, 1]
+
+        frame_h, frame_w = frame_shape[:2]
+        tl_x = max(0, float(min(x_coords)))
+        tl_y = max(0, float(min(y_coords)))
+        br_x = min(frame_w, float(max(x_coords)))
+        br_y = min(frame_h, float(max(y_coords)))
+
         if (br_x - tl_x) < 10 or (br_y - tl_y) < 10:
             return None
-            
+
         return (tl_x, tl_y, br_x, br_y)
+
+    def _format_bbox(self, obj_id, bbox):
+        """Kutuyu şartname JSON formatına dönüştürür."""
+        return format_undefined_object_output(
+            obj_id=obj_id,
+            top_left_x=bbox[0],
+            top_left_y=bbox[1],
+            bottom_right_x=bbox[2],
+            bottom_right_y=bbox[3]
+        )
