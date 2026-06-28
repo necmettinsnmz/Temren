@@ -6,4 +6,3 @@ torch>=2.0.0
 torchvision>=0.15.0
 kornia>=0.6.11
 timm>=1.0.0
-mobile-sam>=1.0
