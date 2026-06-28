@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Logs
+project.log
+*.log
+
+# Models & Large weights
+*.pt
+*.pth
+*.onnx
+models/
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# User specific test files
+*.png
+*.jpg
+*.jpeg
+*.webp
