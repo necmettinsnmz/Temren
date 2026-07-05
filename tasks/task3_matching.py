@@ -86,6 +86,15 @@ class ImageMatcher:
         if not reference_objects:
             return matched_objects
 
+        # Tüm frame boyunca SADECE 1 KERE çıkarılacak özellikler (LightGlue FPS Optimizasyonu)
+        frame_feats = None
+        frame_scale_val = None
+        frame_resized_shape = None
+        
+        # SAM Optimizasyonu: Aynı karede birden fazla SAM iyileştirmesi (refinement) gerekirse
+        # set_image (ViT extraction) fonksiyonunu sadece ilkinde çalıştır
+        sam_image_set = False
+
         try:
             for ref_obj in reference_objects:
                 obj_id = ref_obj["id"]
@@ -103,12 +112,34 @@ class ImageMatcher:
                 )
 
                 if needs_detection:
-                    bbox, match_points = self._detect(frame, ref_obj)
+                    # LightGlue kullanılıyorsa ana karenin haritasını (feats) sadece 1 kez çıkar
+                    if self.use_lightglue and frame_feats is None:
+                        from utils.preprocessing import resize_with_aspect_ratio
+                        f_res, f_scale = resize_with_aspect_ratio(frame, max_dim=960)
+                        f_enh = enhance_image(f_res)
+                        img1 = self._to_tensor(f_enh)
+                        with torch.inference_mode():
+                            frame_feats = self.extractor.extract(img1)
+                        frame_scale_val = f_scale
+                        frame_resized_shape = f_res.shape
+
+                    bbox, match_points = self._detect(
+                        frame, ref_obj, 
+                        frame_feats=frame_feats, 
+                        frame_scale=frame_scale_val, 
+                        frame_resized_shape=frame_resized_shape
+                    )
 
                     if bbox is not None:
                         # MobileSAM ile kutuyu iyileştir
                         if self.use_sam and match_points is not None:
-                            refined_bbox = self._refine_with_sam(frame, match_points, bbox)
+                            # Sadece ilk SAM çağrısında frame'i SAM'a yükle (Hız optimizasyonu)
+                            if not sam_image_set:
+                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                self.sam_predictor.set_image(frame_rgb)
+                                sam_image_set = True
+
+                            refined_bbox = self._refine_with_sam(match_points, bbox)
                             if refined_bbox is not None:
                                 bbox = refined_bbox
 
@@ -136,26 +167,21 @@ class ImageMatcher:
     # =========================================================================
     # TESPİT (DETECTION) KATMANI
     # =========================================================================
-    def _detect(self, frame, ref_obj):
+    def _detect(self, frame, ref_obj, **kwargs):
         """LightGlue veya SIFT ile eşleştirme yapar. bbox ve eşleşen noktaları döndürür."""
         if self.use_lightglue:
-            return self._match_lightglue(frame, ref_obj)
+            return self._match_lightglue(frame, ref_obj, **kwargs)
         else:
             bbox = self._match_sift(frame, ref_obj["image"])
             return bbox, None
 
-    def _match_lightglue(self, frame, ref_obj):
+    def _match_lightglue(self, frame, ref_obj, frame_feats=None, frame_scale=None, frame_resized_shape=None):
         """SuperPoint + LightGlue ile referans objeyi ana karede arar."""
         from lightglue.utils import rbd
         from utils.preprocessing import resize_with_aspect_ratio
 
         obj_id = ref_obj["id"]
         ref_img = ref_obj["image"]
-
-        # Ana kareyi işlenebilir boyuta küçült (Hız optimizasyonu)
-        frame_resized, frame_scale = resize_with_aspect_ratio(frame, max_dim=960)
-        frame_enhanced = enhance_image(frame_resized)
-        img1 = self._to_tensor(frame_enhanced)
 
         with torch.inference_mode():
             # Referans görselin özelliklerini (features) sadece 1 kez çıkar ve Cache'le
@@ -171,7 +197,7 @@ class ImageMatcher:
                 }
             
             feats0 = self.ref_features_cache[obj_id]["feats"]
-            feats1 = self.extractor.extract(img1)
+            feats1 = frame_feats
             matches01 = self.matcher({"image0": feats0, "image1": feats1})
 
         feats0, feats1, matches01 = [rbd(x) for x in [feats0, feats1, matches01]]
@@ -215,7 +241,7 @@ class ImageMatcher:
         transformed = cv2.perspectiveTransform(corners, H)
 
         # Küçültülmüş karedeki BBox'ı Orijinal 1080p/4K kareye göre geri büyüt (Scale Up)
-        bbox_resized = self._corners_to_bbox(transformed, frame_resized.shape)
+        bbox_resized = self._corners_to_bbox(transformed, frame_resized_shape)
         if bbox_resized is None:
             return None, None
             
@@ -297,10 +323,11 @@ class ImageMatcher:
     # =========================================================================
     # SAM İYİLEŞTİRME (REFINEMENT) KATMANI
     # =========================================================================
-    def _refine_with_sam(self, frame, match_points, fallback_bbox):
+    def _refine_with_sam(self, match_points, fallback_bbox):
         """
         MobileSAM ile eşleşen noktalardan piksel düzeyinde maske çıkarır.
         Maskeden elde edilen kutu, LightGlue kutusundan çok daha hassastır.
+        Not: `self.sam_predictor.set_image()` çağrısının önceden yapılmış olduğu varsayılır.
         
         Strateji: Hem nokta hem de kutu promptu birlikte verilir.
         - Nokta promptları: "Obje buralarda" ipucu
@@ -308,8 +335,6 @@ class ImageMatcher:
         Bu ikisinin birleşimi, tek başına noktadan çok daha isabetli maske çıkarır.
         """
         try:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            self.sam_predictor.set_image(frame_rgb)
 
             # En fazla 32 nokta ver (çok fazla nokta SAM'ı yanıltabilir)
             if len(match_points) > 32:
