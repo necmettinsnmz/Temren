@@ -125,5 +125,9 @@ if __name__ == "__main__":
     parser.add_argument("--out", type=str, default="test_outputs/dataset_sonuc.mp4", help="Çıktı video dosyası")
     
     args = parser.parse_args()
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        
     run_dataset_test(args.video, args.ref_dir, args.out)
