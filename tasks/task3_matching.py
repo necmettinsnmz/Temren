@@ -187,6 +187,12 @@ class ImageMatcher:
         if H is None:
             return None, None
 
+        # Minimum Inlier Kontrolü: 
+        # Geometrik olarak eşleşen nokta sayısı çok azsa (örn < 12), büyük ihtimalle sahte kutudur.
+        if mask is None or np.sum(mask) < 12:
+            log.debug(f"Yetersiz inlier sayısı ({np.sum(mask) if mask is not None else 0} < 12), atlanıyor.")
+            return None, None
+
         # Geometrik doğrulama: Saçma homografileri reddet
         if not verify_homography(H, ref_img.shape):
             log.debug("Homografi geometrik doğrulamadan geçemedi, atlanıyor.")
@@ -229,8 +235,8 @@ class ImageMatcher:
         ref_h, ref_w = orig_ref_h, orig_ref_w
         ref_area = ref_h * ref_w
 
-        # 1) Kutu, karenin %20'sinden büyükse yanlış tespit (Yarışmada objeler çok küçüktür)
-        if bbox_area > frame_area * 0.20:
+        # 1) Kutu, karenin %40'ından büyükse yanlış tespit
+        if bbox_area > frame_area * 0.40:
             log.debug(f"Tespit edilen kutu cok buyuk ({bbox_area/frame_area:.1%} kare alani), atlaniyor.")
             return None, None
 
