@@ -24,3 +24,8 @@ Thumbs.db
 *.jpg
 *.jpeg
 *.webp
+
+# Test outputs & videos
+test_outputs/
+*.mp4
+*.avi
