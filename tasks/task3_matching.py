@@ -90,9 +90,15 @@ class ImageMatcher:
                 obj_id = ref_obj["id"]
                 ref_img = ref_obj["image"]
 
+                # 6 objenin 6'sı da aynı anda LightGlue'ya girmesin diye offset (gecikme) ekliyoruz
+                try:
+                    offset = int(obj_id) * 3
+                except (ValueError, TypeError):
+                    offset = sum(ord(c) for c in str(obj_id)) * 3
+
                 needs_detection = (
                     obj_id not in self.trackers or
-                    self.frame_count % TRACKER_REDETECTION_INTERVAL == 0
+                    (self.frame_count + offset) % TRACKER_REDETECTION_INTERVAL == 0
                 )
 
                 if needs_detection:
