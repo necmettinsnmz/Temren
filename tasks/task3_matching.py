@@ -173,7 +173,7 @@ class ImageMatcher:
 
         # Güven skoru hesapla
         confidence = compute_match_confidence(matches, m_kpts0, m_kpts1, mask)
-        if confidence < 0.25:
+        if confidence < 0.45:
             log.debug(f"Eşleşme güven skoru çok düşük: {confidence:.3f}, atlanıyor.")
             return None, None
         log.debug(f"Eşleşme güven skoru: {confidence:.3f}")
@@ -185,6 +185,24 @@ class ImageMatcher:
 
         bbox = self._corners_to_bbox(transformed, frame.shape)
         if bbox is None:
+            return None, None
+
+        # Kutu boyut doğrulaması: Tespit edilen kutu mantıklı mı?
+        bbox_w = bbox[2] - bbox[0]
+        bbox_h = bbox[3] - bbox[1]
+        bbox_area = bbox_w * bbox_h
+        frame_h, frame_w = frame.shape[:2]
+        frame_area = frame_w * frame_h
+        ref_area = ref_img.shape[0] * ref_img.shape[1]
+
+        # 1) Kutu, karenin %60'ından büyükse yanlış tespit
+        if bbox_area > frame_area * 0.6:
+            log.debug(f"Tespit edilen kutu çok büyük ({bbox_area/frame_area:.1%} kare alanı), atlanıyor.")
+            return None, None
+
+        # 2) Kutu, referans objenin 8 katından büyükse yanlış tespit
+        if bbox_area > ref_area * 8:
+            log.debug(f"Tespit edilen kutu referansa göre çok büyük ({bbox_area/ref_area:.1f}x), atlanıyor.")
             return None, None
 
         # Inlier eşleşme noktalarını SAM için sakla

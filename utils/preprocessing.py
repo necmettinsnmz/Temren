@@ -124,7 +124,7 @@ def verify_homography(H, image_shape):
     original_area = w * h
     transformed_area = cv2.contourArea(transformed.reshape(-1, 2))
     
-    if transformed_area < original_area * 0.05 or transformed_area > original_area * 15:
+    if transformed_area < original_area * 0.1 or transformed_area > original_area * 5:
         return False
     
     # 2. Konvekslik kontrolü: Dönüştürülmüş dörtgenin konveks olması lazım (ters dönmemiş)
