@@ -162,7 +162,7 @@ class ImageMatcher:
         m_kpts0 = feats0['keypoints'][matches[..., 0]].cpu().numpy()
         m_kpts1 = feats1['keypoints'][matches[..., 1]].cpu().numpy()
 
-        H, mask = cv2.findHomography(m_kpts0, m_kpts1, cv2.RANSAC, 5.0)
+        H, mask = cv2.findHomography(m_kpts0, m_kpts1, cv2.RANSAC, 3.0)
         if H is None:
             return None, None
 
@@ -193,16 +193,30 @@ class ImageMatcher:
         bbox_area = bbox_w * bbox_h
         frame_h, frame_w = frame.shape[:2]
         frame_area = frame_w * frame_h
-        ref_area = ref_img.shape[0] * ref_img.shape[1]
+        ref_h, ref_w = ref_img.shape[:2]
+        ref_area = ref_h * ref_w
 
-        # 1) Kutu, karenin %60'ından büyükse yanlış tespit
-        if bbox_area > frame_area * 0.6:
-            log.debug(f"Tespit edilen kutu çok büyük ({bbox_area/frame_area:.1%} kare alanı), atlanıyor.")
+        # 1) Kutu, karenin %40'ından büyükse yanlış tespit
+        if bbox_area > frame_area * 0.4:
+            log.debug(f"Tespit edilen kutu cok buyuk ({bbox_area/frame_area:.1%} kare alani), atlaniyor.")
             return None, None
 
-        # 2) Kutu, referans objenin 8 katından büyükse yanlış tespit
-        if bbox_area > ref_area * 8:
-            log.debug(f"Tespit edilen kutu referansa göre çok büyük ({bbox_area/ref_area:.1f}x), atlanıyor.")
+        # 2) Kutu, referans objenin 5 katından büyükse yanlış tespit
+        if bbox_area > ref_area * 5:
+            log.debug(f"Tespit edilen kutu referansa gore cok buyuk ({bbox_area/ref_area:.1f}x), atlaniyor.")
+            return None, None
+
+        # 3) Kutu, referans objenin %15'inden küçükse yanlış tespit (çok küçük parça)
+        if bbox_area < ref_area * 0.15:
+            log.debug(f"Tespit edilen kutu cok kucuk ({bbox_area/ref_area:.2f}x referans), atlaniyor.")
+            return None, None
+
+        # 4) En-boy oranı kontrolü: Referans ile tespitin oranı çok farklıysa reddet
+        ref_ratio = ref_w / ref_h
+        bbox_ratio = bbox_w / bbox_h
+        ratio_diff = max(ref_ratio, bbox_ratio) / max(min(ref_ratio, bbox_ratio), 0.01)
+        if ratio_diff > 3.0:
+            log.debug(f"En-boy orani uyumsuz (ref: {ref_ratio:.2f}, tespit: {bbox_ratio:.2f}), atlaniyor.")
             return None, None
 
         # Inlier eşleşme noktalarını SAM için sakla
