@@ -29,9 +29,10 @@ class ImageMatcher:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         log.info(f"Cihaz: {self.device}")
 
-        # Takipçi (Tracker) durumları
+        # Takipçi (Tracker) durumları ve önbellek
         self.trackers = {}
         self.frame_count = 0
+        self.ref_features_cache = {}
 
         # --- LightGlue Yükleme ---
         try:
@@ -102,7 +103,7 @@ class ImageMatcher:
                 )
 
                 if needs_detection:
-                    bbox, match_points = self._detect(frame, ref_img)
+                    bbox, match_points = self._detect(frame, ref_obj)
 
                     if bbox is not None:
                         # MobileSAM ile kutuyu iyileştir
@@ -135,27 +136,41 @@ class ImageMatcher:
     # =========================================================================
     # TESPİT (DETECTION) KATMANI
     # =========================================================================
-    def _detect(self, frame, ref_img):
+    def _detect(self, frame, ref_obj):
         """LightGlue veya SIFT ile eşleştirme yapar. bbox ve eşleşen noktaları döndürür."""
         if self.use_lightglue:
-            return self._match_lightglue(frame, ref_img)
+            return self._match_lightglue(frame, ref_obj)
         else:
-            bbox = self._match_sift(frame, ref_img)
+            bbox = self._match_sift(frame, ref_obj["image"])
             return bbox, None
 
-    def _match_lightglue(self, frame, ref_img):
+    def _match_lightglue(self, frame, ref_obj):
         """SuperPoint + LightGlue ile referans objeyi ana karede arar."""
         from lightglue.utils import rbd
+        from utils.preprocessing import resize_with_aspect_ratio
 
-        # Ön işleme: CLAHE ile kontrast iyileştirmesi
-        ref_enhanced = enhance_image(ref_img)
-        frame_enhanced = enhance_image(frame)
+        obj_id = ref_obj["id"]
+        ref_img = ref_obj["image"]
 
-        img0 = self._to_tensor(ref_enhanced)
+        # Ana kareyi işlenebilir boyuta küçült (Hız optimizasyonu)
+        frame_resized, frame_scale = resize_with_aspect_ratio(frame, max_dim=960)
+        frame_enhanced = enhance_image(frame_resized)
         img1 = self._to_tensor(frame_enhanced)
 
         with torch.inference_mode():
-            feats0 = self.extractor.extract(img0)
+            # Referans görselin özelliklerini (features) sadece 1 kez çıkar ve Cache'le
+            if obj_id not in self.ref_features_cache:
+                ref_resized, ref_scale = resize_with_aspect_ratio(ref_img, max_dim=640)
+                ref_enhanced = enhance_image(ref_resized)
+                img0 = self._to_tensor(ref_enhanced)
+                feats0 = self.extractor.extract(img0)
+                self.ref_features_cache[obj_id] = {
+                    "feats": feats0,
+                    "scale": ref_scale,
+                    "shape": ref_img.shape
+                }
+            
+            feats0 = self.ref_features_cache[obj_id]["feats"]
             feats1 = self.extractor.extract(img1)
             matches01 = self.matcher({"image0": feats0, "image1": feats1})
 
@@ -184,14 +199,26 @@ class ImageMatcher:
             return None, None
         log.debug(f"Eşleşme güven skoru: {confidence:.3f}")
 
-        # Referans görüntünün köşelerini ana kareye yansıt
-        h, w = ref_img.shape[:2]
-        corners = np.float32([[0, 0], [0, h-1], [w-1, h-1], [w-1, 0]]).reshape(-1, 1, 2)
+        # Orijinal referans boyutunu ve ölçeklerini al
+        ref_scale = self.ref_features_cache[obj_id]["scale"]
+        orig_ref_h, orig_ref_w = self.ref_features_cache[obj_id]["shape"][:2]
+        scaled_ref_w, scaled_ref_h = int(orig_ref_w * ref_scale), int(orig_ref_h * ref_scale)
+
+        # Dönüşüm matrisini uygulayıp köşeleri bul (Küçültülmüş kareye göre)
+        corners = np.float32([[0, 0], [0, scaled_ref_h-1], [scaled_ref_w-1, scaled_ref_h-1], [scaled_ref_w-1, 0]]).reshape(-1, 1, 2)
         transformed = cv2.perspectiveTransform(corners, H)
 
-        bbox = self._corners_to_bbox(transformed, frame.shape)
-        if bbox is None:
+        # Küçültülmüş karedeki BBox'ı Orijinal 1080p/4K kareye göre geri büyüt (Scale Up)
+        bbox_resized = self._corners_to_bbox(transformed, frame_resized.shape)
+        if bbox_resized is None:
             return None, None
+            
+        bbox = (
+            bbox_resized[0] / frame_scale,
+            bbox_resized[1] / frame_scale,
+            bbox_resized[2] / frame_scale,
+            bbox_resized[3] / frame_scale
+        )
 
         # Kutu boyut doğrulaması: Tespit edilen kutu mantıklı mı?
         bbox_w = bbox[2] - bbox[0]
@@ -199,11 +226,11 @@ class ImageMatcher:
         bbox_area = bbox_w * bbox_h
         frame_h, frame_w = frame.shape[:2]
         frame_area = frame_w * frame_h
-        ref_h, ref_w = ref_img.shape[:2]
+        ref_h, ref_w = orig_ref_h, orig_ref_w
         ref_area = ref_h * ref_w
 
-        # 1) Kutu, karenin %40'ından büyükse yanlış tespit
-        if bbox_area > frame_area * 0.4:
+        # 1) Kutu, karenin %20'sinden büyükse yanlış tespit (Yarışmada objeler çok küçüktür)
+        if bbox_area > frame_area * 0.20:
             log.debug(f"Tespit edilen kutu cok buyuk ({bbox_area/frame_area:.1%} kare alani), atlaniyor.")
             return None, None
 
