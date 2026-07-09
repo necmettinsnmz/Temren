@@ -502,7 +502,7 @@ class ImageMatcher:
     def _format_bbox(self, obj_id, bbox):
         """BBox'ı şartname JSON formatına çevirir."""
         return format_undefined_object_output(
-            object_id=obj_id,
+            obj_id=obj_id,
             top_left_x=float(bbox[0]),
             top_left_y=float(bbox[1]),
             bottom_right_x=float(bbox[2]),
