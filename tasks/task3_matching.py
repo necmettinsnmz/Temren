@@ -1,29 +1,28 @@
 """
-Görev 3: Görüntü Eşleme — DINOv2 + LoFTR Hibrit Mimari
+Görev 3: Görüntü Eşleme — DINOv2 + LoFTR Hibrit Mimari (v2 — Temiz Yeniden Yazım)
 
 Pipeline:
   1. DINOv2 ile kaba konum tespiti (Coarse Localization)
-     - Referans görselin "anlamsal parmak izi"ni (CLS embedding) çıkar
+     - Referans görselin "anlamsal parmak izi"ni (patch token ortalaması) çıkar
      - Video karesini yama (patch) bazlı tara, en benzer bölgeleri bul
-     - Bu aşama bakış açısı, ölçek ve hatta modalite (termal/RGB) farkına dayanıklıdır
-  
+     - Multi-scale aday bölgeler oluştur
+
   2. LoFTR ile hassas eşleştirme (Fine Matching)
-     - DINOv2'nin bulduğu aday bölgelerde yoğun piksel eşleştirmesi yap
+     - Her aday bölgede yoğun piksel eşleştirmesi yap
      - Homografi + RANSAC ile geometrik doğrulama
+     - verify_homography ile saçma kutuları reddet
      - Hassas bounding box çıkar
-  
+
   3. CSRT Tracker ile kare-arası takip
      - Obje bulunduğunda, sonraki karelerde hızlıca takip et
      - Periyodik olarak DINOv2+LoFTR ile tekrar doğrula
 
-Neden bu mimari?
-  - LightGlue/SuperPoint BAŞARISIZ oldu çünkü seyrek öznitelik eşleştirici,
-    büyük bakış açısı farkları (yandan çekim → üstten drone) ve dokusuz 
-    yüzeyler (çim, metal) ile baş edemiyor.
-  - DINOv2 kavramsal (semantic) seviyede çalışır: "bu bir biçerdöver" gibi
-    üst düzey anlayışa sahiptir, piksel düzeyinde eşleştirme gerektirmez.
-  - LoFTR dedektör-bağımsız (detector-free) yoğun eşleştirme yapar,
-    SuperPoint'in aksine nokta bulmaya ihtiyaç duymaz.
+Önceki sürümün sorunları (v1):
+  - DINOv2 fallback: LoFTR başarısız olduğunda bile kutu döndürüyordu → çöp tespiti
+  - Aday bölge boyutu çok küçüktü → gerçek objeleri kaçırıyordu
+  - LoFTR güven eşiği çok yüksekti → hiç eşleşme bulamıyordu
+  - CLAHE preprocessing uygulanmıyordu
+  - verify_homography kullanılmıyordu
 """
 
 import cv2
@@ -35,19 +34,21 @@ from config import (
     DINOV2_MODEL_NAME, DINOV2_SIMILARITY_THRESHOLD,
     DINOV2_INPUT_SIZE, DINOV2_TOP_K_CANDIDATES,
     LOFTR_PRETRAINED, LOFTR_MIN_MATCHES,
-    LOFTR_CONFIDENCE_THRESHOLD, LOFTR_MAX_IMAGE_SIZE,
+    LOFTR_CONFIDENCE_THRESHOLD, LOFTR_MATCH_CONFIDENCE,
+    LOFTR_MAX_IMAGE_SIZE,
+    CANDIDATE_SCALES, CANDIDATE_MIN_SIZE,
     MOBILESAM_MODEL_PATH, USE_SAM_REFINEMENT,
     TRACKER_REDETECTION_INTERVAL
 )
 from utils.helper import format_undefined_object_output
 from utils.logger import log
-from utils.preprocessing import enhance_image
+from utils.preprocessing import enhance_image, verify_homography
 
 
 class ImageMatcher:
     """
-    Görüntü Eşleme modülü — DINOv2 + LoFTR Hibrit Mimari.
-    
+    Görüntü Eşleme modülü — DINOv2 + LoFTR Hibrit Mimari (v2).
+
     Yarışma arayüzü (TEAM_INTERFACE) ile tam uyumlu:
       - __init__(): Model yükleme
       - run(frame, reference_objects): Her kare için çağrılır, JSON-uyumlu list döner
@@ -60,9 +61,19 @@ class ImageMatcher:
 
         # Takipçi (Tracker) durumları ve önbellek
         self.trackers = {}
+        self.tracker_bboxes = {}          # Son bilinen bbox (tracker sonucu)
         self.frame_count = 0
-        self.ref_embeddings_cache = {}   # DINOv2 referans embedding'leri
+        self.ref_embeddings_cache = {}    # DINOv2 referans embedding'leri
+        self.ref_enhanced_cache = {}      # CLAHE uygulanmış referans görseller
         self.dinov2_patch_size = 14
+
+        # İstatistik sayaçları (loglama için)
+        self.stats = {
+            "dinov2_candidates": 0,
+            "loftr_verified": 0,
+            "tracker_used": 0,
+            "no_detection": 0,
+        }
 
         # --- DINOv2 Yükleme ---
         self.dinov2 = None
@@ -108,11 +119,11 @@ class ImageMatcher:
     def run(self, frame, reference_objects=None, **kwargs):
         """
         Her frame için çağrılır.
-        
+
         Args:
             frame: Ana görüntü (numpy array, BGR).
             reference_objects: [{"id": int, "image": numpy_array}, ...] formatında.
-        
+
         Returns:
             Eşleşen objelerin listesi (şartname JSON formatında).
         """
@@ -122,13 +133,16 @@ class ImageMatcher:
         if not reference_objects:
             return matched_objects
 
+        # Frame'e CLAHE uygula (DINOv2 + LoFTR'ın detayları görmesi için)
+        frame_enhanced = enhance_image(frame, apply_clahe=True, apply_denoise=False)
+
         # DINOv2 frame özelliklerini tüm objeler için sadece 1 kez çıkar
         frame_patch_data = None
 
-        try:
-            for ref_obj in reference_objects:
-                obj_id = ref_obj["id"]
+        for ref_obj in reference_objects:
+            obj_id = ref_obj["id"]
 
+            try:
                 # Offset: Tüm objeler aynı karede aranmasın (hız optimizasyonu)
                 try:
                     offset = int(obj_id) * 3
@@ -141,29 +155,61 @@ class ImageMatcher:
                 )
 
                 if needs_detection:
-                    # DINOv2 frame özelliklerini lazy-init (ilk ihtiyaç duyulduğunda)
+                    # DINOv2 frame özelliklerini lazy-init
                     if frame_patch_data is None:
-                        frame_patch_data = self._extract_frame_patches(frame)
+                        frame_patch_data = self._extract_frame_patches(frame_enhanced)
 
-                    bbox = self._detect(frame, ref_obj, frame_patch_data)
+                    bbox = self._detect(frame_enhanced, ref_obj, frame_patch_data)
 
                     if bbox is not None:
                         self._init_tracker(obj_id, frame, bbox)
                         matched_objects.append(self._format_bbox(obj_id, bbox))
-                        log.info(f"Obje {obj_id} tespit edildi. BBox: {bbox}")
+                        self.stats["loftr_verified"] += 1
                     else:
-                        log.debug(f"Obje {obj_id} bu karede bulunamadı.")
-                        self.trackers.pop(obj_id, None)
+                        # Tespit başarısız — tracker varsa onu kullanmayı dene
+                        if obj_id in self.trackers:
+                            tracked_bbox = self._track(obj_id, frame)
+                            if tracked_bbox is not None:
+                                matched_objects.append(self._format_bbox(obj_id, tracked_bbox))
+                                self.stats["tracker_used"] += 1
+                            else:
+                                self.trackers.pop(obj_id, None)
+                                self.tracker_bboxes.pop(obj_id, None)
+                                self.stats["no_detection"] += 1
+                        else:
+                            self.stats["no_detection"] += 1
                 else:
                     # Tracker ile takip et
                     tracked_bbox = self._track(obj_id, frame)
                     if tracked_bbox is not None:
                         matched_objects.append(self._format_bbox(obj_id, tracked_bbox))
+                        self.stats["tracker_used"] += 1
                     else:
-                        log.warning(f"Obje {obj_id} takibi kaybedildi.")
+                        # Tracker başarısız — hemen yeniden tespit dene
+                        if frame_patch_data is None:
+                            frame_patch_data = self._extract_frame_patches(frame_enhanced)
 
-        except Exception as e:
-            log.error(f"Görev 3 çalışırken hata: {e}", exc_info=True)
+                        bbox = self._detect(frame_enhanced, ref_obj, frame_patch_data)
+                        if bbox is not None:
+                            self._init_tracker(obj_id, frame, bbox)
+                            matched_objects.append(self._format_bbox(obj_id, bbox))
+                            self.stats["loftr_verified"] += 1
+                        else:
+                            self.trackers.pop(obj_id, None)
+                            self.tracker_bboxes.pop(obj_id, None)
+                            self.stats["no_detection"] += 1
+
+            except Exception as e:
+                log.error(f"Görev 3 Obje {obj_id} çalışırken hata: {e}", exc_info=True)
+
+        # Her 100 karede istatistik logla
+        if self.frame_count % 100 == 0:
+            log.info(
+                f"[Görev 3 İstatistik] Kare {self.frame_count}: "
+                f"LoFTR={self.stats['loftr_verified']}, "
+                f"Tracker={self.stats['tracker_used']}, "
+                f"Boş={self.stats['no_detection']}"
+            )
 
         return matched_objects
 
@@ -174,37 +220,82 @@ class ImageMatcher:
         """
         Aşama 1: DINOv2 ile kaba konum tespiti
         Aşama 2: LoFTR ile hassas eşleştirme ve BBox çıkarma
+
+        ÖNEMLİ: LoFTR doğrulaması başarısız olursa None döndürür.
+        Yanlış pozitif göndermek, hiç göndermemekten daha kötüdür.
         """
         obj_id = ref_obj["id"]
         ref_img = ref_obj["image"]
 
+        # Referans görseli cache'le ve CLAHE uygula
+        if obj_id not in self.ref_enhanced_cache:
+            self.ref_enhanced_cache[obj_id] = enhance_image(
+                ref_img, apply_clahe=True, apply_denoise=False
+            )
+        ref_enhanced = self.ref_enhanced_cache[obj_id]
+
         # === Aşama 1: DINOv2 Kaba Arama ===
-        candidate_regions = self._dinov2_coarse_search(
-            frame, ref_img, obj_id, frame_patch_data
+        candidate_centers = self._dinov2_coarse_search(
+            frame, ref_enhanced, obj_id, frame_patch_data
         )
 
-        if not candidate_regions:
+        if not candidate_centers:
+            log.debug(f"Obje {obj_id}: DINOv2 hiç aday bulamadı.")
             return None
 
-        # === Aşama 2: LoFTR İnce Eşleştirme ===
-        if self.loftr is not None:
-            best_bbox = None
-            best_score = 0
+        self.stats["dinov2_candidates"] += len(candidate_centers)
 
-            for region_bbox in candidate_regions:
-                bbox, score = self._loftr_fine_match(frame, ref_img, region_bbox)
+        # === Aşama 2: LoFTR İnce Eşleştirme (Multi-Scale) ===
+        if self.loftr is None:
+            log.warning("LoFTR yüklü değil, tespit yapılamıyor.")
+            return None
+
+        best_bbox = None
+        best_score = 0
+        frame_h, frame_w = frame.shape[:2]
+        ref_h, ref_w = ref_enhanced.shape[:2]
+
+        for center_x, center_y, similarity_score in candidate_centers:
+            # Multi-scale: Her aday merkezi etrafında farklı boyutlarda kırpma dene
+            for scale in CANDIDATE_SCALES:
+                # Bölge boyutunu referans boyutuna ve ölçeğe göre hesapla
+                # Dron yüksekliğine göre referans obje çok farklı boyutlarda olabilir
+                region_w = max(int(ref_w * scale * 1.5), CANDIDATE_MIN_SIZE)
+                region_h = max(int(ref_h * scale * 1.5), CANDIDATE_MIN_SIZE)
+
+                # Kare en-boy oranını da dikkate al
+                region_w = max(region_w, int(region_h * (ref_w / max(ref_h, 1))))
+                region_h = max(region_h, int(region_w * (ref_h / max(ref_w, 1))))
+
+                x1 = max(0, int(center_x - region_w / 2))
+                y1 = max(0, int(center_y - region_h / 2))
+                x2 = min(frame_w, int(center_x + region_w / 2))
+                y2 = min(frame_h, int(center_y + region_h / 2))
+
+                if (x2 - x1) < 50 or (y2 - y1) < 50:
+                    continue
+
+                region_bbox = (x1, y1, x2, y2)
+                bbox, score = self._loftr_fine_match(frame, ref_enhanced, region_bbox)
+
                 if bbox is not None and score > best_score:
                     best_bbox = bbox
                     best_score = score
 
-            if best_bbox is not None and best_score >= LOFTR_CONFIDENCE_THRESHOLD:
-                log.debug(f"Obje {obj_id}: LoFTR eşleştirme skoru {best_score:.2f}")
-                return best_bbox
+        if best_bbox is not None and best_score >= LOFTR_CONFIDENCE_THRESHOLD:
+            log.info(
+                f"Obje {obj_id}: LoFTR DOĞRULADI — skor {best_score:.3f}, "
+                f"BBox ({best_bbox[0]},{best_bbox[1]})-({best_bbox[2]},{best_bbox[3]})"
+            )
+            return best_bbox
 
-        # LoFTR başarısız veya yüklü değilse, DINOv2'nin en iyi adayını döndür
-        # (Bu fallback, en azından bir kutu üretir)
-        log.debug(f"Obje {obj_id}: LoFTR eşleşme bulamadı, DINOv2 aday bölgesi kullanılıyor.")
-        return candidate_regions[0]
+        # LoFTR doğrulayamadı — hiçbir şey döndürme
+        log.debug(
+            f"Obje {obj_id}: LoFTR doğrulayamadı "
+            f"(en iyi skor: {best_score:.3f}, eşik: {LOFTR_CONFIDENCE_THRESHOLD}). "
+            f"Tespit atlanıyor."
+        )
+        return None
 
     # =========================================================================
     # AŞAMA 1: DINOv2 KABA KONUM TESPİTİ
@@ -235,16 +326,19 @@ class ImageMatcher:
     def _dinov2_coarse_search(self, frame, ref_img, obj_id, frame_patch_data):
         """
         DINOv2 patch-token tabanlı kaba arama.
-        
-        Her yama (patch) için referans ile anlamsal benzerlik hesaplar.
-        En yüksek benzerlikli bölgeleri aday olarak döndürür.
+
+        Referans görselin patch token ortalamasını alıp frame patch'leriyle
+        cosine similarity hesaplar. En yüksek benzerlikli merkez noktalarını döndürür.
+
+        Returns:
+            List of (center_x, center_y, similarity_score) tuples.
         """
         if frame_patch_data is None or self.dinov2 is None:
             return []
 
         # Referans embedding'i cache'le (her referans için sadece 1 kez)
         if obj_id not in self.ref_embeddings_cache:
-            ref_emb = self._extract_dinov2_cls(ref_img)
+            ref_emb = self._extract_dinov2_embedding(ref_img)
             if ref_emb is None:
                 return []
             self.ref_embeddings_cache[obj_id] = ref_emb
@@ -265,12 +359,12 @@ class ImageMatcher:
 
         # Heatmap'i yumuşat (birbirine yakın yüksek değerleri birleştir)
         from scipy.ndimage import gaussian_filter
-        heatmap_smooth = gaussian_filter(heatmap, sigma=1.0)
+        heatmap_smooth = gaussian_filter(heatmap, sigma=1.5)
 
-        # Dinamik eşik: ortalama + 1.5 standart sapma veya sabit eşikten yüksek olanı
+        # Dinamik eşik: ortalama + 1 standart sapma veya sabit eşikten yüksek olanı
         dynamic_threshold = max(
             DINOV2_SIMILARITY_THRESHOLD,
-            float(heatmap_smooth.mean() + 1.5 * heatmap_smooth.std())
+            float(heatmap_smooth.mean() + 1.0 * heatmap_smooth.std())
         )
 
         candidates = []
@@ -288,30 +382,10 @@ class ImageMatcher:
             patch_w = frame_w / num_patches
             patch_h = frame_h / num_patches
 
-            cx = (px + 0.5) * patch_w
-            cy = (py + 0.5) * patch_h
+            center_x = (px + 0.5) * patch_w
+            center_y = (py + 0.5) * patch_h
 
-            # Aday bölge boyutu: referans objenin en-boy oranına göre ölçekle
-            ref_h, ref_w = ref_img.shape[:2]
-            ref_aspect = ref_w / max(ref_h, 1)
-
-            # Aday bölgenin boyutunu kareye ve referans boyutuna göre ayarla
-            # Obje dron yüksekliğine bağlı olarak çok farklı boyutlarda olabilir
-            search_size = max(patch_w * 6, patch_h * 6, 100)
-
-            half_w = search_size * max(ref_aspect, 1.0) / 2
-            half_h = search_size / max(ref_aspect, 1.0) / 2
-            # Minimum boyut garantisi
-            half_w = max(half_w, 60)
-            half_h = max(half_h, 60)
-
-            x1 = max(0, int(cx - half_w))
-            y1 = max(0, int(cy - half_h))
-            x2 = min(frame_w, int(cx + half_w))
-            y2 = min(frame_h, int(cy + half_h))
-
-            if (x2 - x1) > 20 and (y2 - y1) > 20:
-                candidates.append((x1, y1, x2, y2))
+            candidates.append((center_x, center_y, float(max_val)))
 
             # Bu bölgeyi maskele (aynı bölge tekrar seçilmesin)
             suppress_r = 3
@@ -335,12 +409,16 @@ class ImageMatcher:
     def _loftr_fine_match(self, frame, ref_img, candidate_bbox):
         """
         LoFTR ile aday bölge ve referans arasında yoğun eşleştirme.
-        Homografi + RANSAC ile doğrulama, hassas BBox çıkarma.
+        Homografi + RANSAC ile doğrulama, verify_homography ile geometrik kontrol,
+        hassas BBox çıkarma.
+
+        Returns:
+            (bbox_tuple, score) veya (None, 0)
         """
         x1, y1, x2, y2 = [int(v) for v in candidate_bbox]
         crop = frame[y1:y2, x1:x2]
 
-        if crop.size == 0 or crop.shape[0] < 10 or crop.shape[1] < 10:
+        if crop.size == 0 or crop.shape[0] < 30 or crop.shape[1] < 30:
             return None, 0
 
         # Gri tonlamaya çevir (LoFTR grayscale çalışır)
@@ -366,7 +444,7 @@ class ImageMatcher:
         conf = correspondences["confidence"].cpu().numpy()
 
         # Güvenilir eşleşmeleri filtrele
-        high_conf_mask = conf > 0.5
+        high_conf_mask = conf > LOFTR_MATCH_CONFIDENCE
         mkpts0 = mkpts0[high_conf_mask]
         mkpts1 = mkpts1[high_conf_mask]
 
@@ -374,7 +452,7 @@ class ImageMatcher:
             return None, 0
 
         # Homografi hesapla (RANSAC ile)
-        H, inlier_mask = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 3.0)
+        H, inlier_mask = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
         if H is None or inlier_mask is None:
             return None, 0
 
@@ -382,8 +460,12 @@ class ImageMatcher:
         if num_inliers < LOFTR_MIN_MATCHES:
             return None, 0
 
-        # Referans köşelerini aday bölgeye yansıt
+        # Geometrik doğrulama: verify_homography ile saçma kutuları reddet
         h0, w0 = ref_resized.shape[:2]
+        if not verify_homography(H, (h0, w0)):
+            return None, 0
+
+        # Referans köşelerini aday bölgeye yansıt
         corners = np.float32([
             [0, 0], [0, h0 - 1], [w0 - 1, h0 - 1], [w0 - 1, 0]
         ]).reshape(-1, 1, 2)
@@ -406,10 +488,19 @@ class ImageMatcher:
         if bx2 <= bx1 or by2 <= by1:
             return None, 0
 
-        # Geometrik doğrulama: saçma kutular reddedilir
-        bbox_area = (bx2 - bx1) * (by2 - by1)
+        # Ek geometrik doğrulama
+        bbox_w = bx2 - bx1
+        bbox_h = by2 - by1
+        bbox_area = bbox_w * bbox_h
         frame_area = frame.shape[0] * frame.shape[1]
-        if bbox_area > frame_area * 0.5 or bbox_area < 100:
+
+        # Çok büyük kutular (frame'in %50'sinden fazla) veya çok küçük kutular reddet
+        if bbox_area > frame_area * 0.5 or bbox_area < 200:
+            return None, 0
+
+        # En-boy oranı kontrolü: aşırı uzun/ince kutular reddet
+        aspect_ratio = max(bbox_w, bbox_h) / max(min(bbox_w, bbox_h), 1)
+        if aspect_ratio > 10:
             return None, 0
 
         # Güven skoru = inlier oranı
@@ -420,8 +511,16 @@ class ImageMatcher:
     # =========================================================================
     # DINOv2 YARDIMCI FONKSİYONLAR
     # =========================================================================
-    def _extract_dinov2_cls(self, image):
-        """Görüntüden DINOv2 CLS token'ı çıkarır (anlamsal parmak izi)."""
+    def _extract_dinov2_embedding(self, image):
+        """
+        Görüntüden DINOv2 patch token ortalaması çıkarır.
+
+        CLS token yerine patch token ortalaması kullanıyoruz çünkü:
+        - CLS token tüm görüntünün "özetini" verir (arka plan dahil)
+        - Patch token ortalaması nesnenin dokusuna daha çok odaklanır
+        - Referans görsellerde arka plan az olduğu için fark küçük,
+          ama video karelerinde arka plan baskın olduğu için bu önemli
+        """
         if self.dinov2 is None:
             return None
 
@@ -431,9 +530,10 @@ class ImageMatcher:
 
         with torch.inference_mode():
             features = self.dinov2.forward_features(img_tensor)
-            cls_token = features["x_norm_clstoken"]  # [1, D]
+            patch_tokens = features["x_norm_patchtokens"]  # [1, N, D]
 
-        return cls_token.squeeze(0)  # [D]
+        # Patch token ortalaması (CLS yerine — nesneye daha çok odaklanır)
+        return patch_tokens.squeeze(0).mean(dim=0)  # [D]
 
     def _prepare_dinov2_input(self, image):
         """OpenCV BGR → DINOv2 normalized tensor."""
@@ -457,7 +557,7 @@ class ImageMatcher:
     def _resize_for_loftr(self, gray_img):
         """Görüntüyü LoFTR için uygun boyuta getirir (8'in katı, max boyut sınırı)."""
         h, w = gray_img.shape[:2]
-        if h < 8 or w < 8:
+        if h < 16 or w < 16:
             return None, 1.0
 
         # Max boyut sınırı
@@ -467,14 +567,14 @@ class ImageMatcher:
         new_h = int(h * scale)
 
         # 8'in katına yuvarla
-        new_w = max(8, (new_w // 8) * 8)
-        new_h = max(8, (new_h // 8) * 8)
+        new_w = max(16, (new_w // 8) * 8)
+        new_h = max(16, (new_h // 8) * 8)
 
         resized = cv2.resize(gray_img, (new_w, new_h))
         return resized, scale
 
     # =========================================================================
-    # TRACKER (Mevcut — değişmedi)
+    # TRACKER
     # =========================================================================
     def _init_tracker(self, obj_id, frame, bbox):
         """CSRT tracker başlatır."""
@@ -485,6 +585,7 @@ class ImageMatcher:
         tracker = cv2.TrackerCSRT_create()
         tracker.init(frame, (x1, y1, w, h))
         self.trackers[obj_id] = tracker
+        self.tracker_bboxes[obj_id] = bbox
 
     def _track(self, obj_id, frame):
         """Mevcut tracker ile objeyi takip eder."""
@@ -493,11 +594,13 @@ class ImageMatcher:
         success, box = self.trackers[obj_id].update(frame)
         if success:
             x, y, w, h = [int(v) for v in box]
-            return (x, y, x + w, y + h)
+            bbox = (x, y, x + w, y + h)
+            self.tracker_bboxes[obj_id] = bbox
+            return bbox
         return None
 
     # =========================================================================
-    # FORMAT (Mevcut — değişmedi)
+    # FORMAT
     # =========================================================================
     def _format_bbox(self, obj_id, bbox):
         """BBox'ı şartname JSON formatına çevirir."""
