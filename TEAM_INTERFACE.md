@@ -25,14 +25,14 @@ class BaseTask:
 ```
 
 ### Görev 1: Nesne Tespiti (task1_detection.py)
-**Girdi:** `frame` (numpy array)
+**Girdi:** `frame` (numpy array), opsiyonel `use_sahi` (bool) ve `raw_detections` / `detections` (harici/test enjeksiyonu)
 **Çıktı:** Sözlük (dictionary) içeren bir liste. Sözlük elemanları `utils.helper` içerisindeki `format_detection_output` fonksiyonu kullanılarak oluşturulmalıdır.
 **Çıktı Formatı:**
 ```json
 [
   {
     "cls": "0", 
-    "landing_status": "0", 
+    "landing_status": "-1", 
     "motion_status": "1", 
     "top_left_x": 100.5, 
     "top_left_y": 200.0, 
@@ -43,7 +43,7 @@ class BaseTask:
 ```
 
 ### Görev 2: Pozisyon Tespiti (task2_position.py)
-**Girdi:** `frame` (numpy array)
+**Girdi:** `frame` (numpy array), opsiyonel `health_status` (int), `translation_x`/`translation_y`/`translation_z` (veya `ref_x`/`ref_y`/`ref_z` GPS referansları), `altitude` (float) ve `camera_type` (`"Termal"`, `"RGB 4K"`, `"RGB 1080p"`)
 **Çıktı:** Sözlük içeren bir liste. Sözlük elemanları `utils.helper` içerisindeki `format_translation_output` kullanılarak oluşturulmalıdır.
 **Çıktı Formatı:**
 ```json
