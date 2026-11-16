@@ -27,5 +27,12 @@ Thumbs.db
 
 # Test outputs & videos
 test_outputs/
+test_data/
 *.mp4
 *.avi
+
+# Competition rulebooks, local datasets & vendored directories
+LightGlue/
+belgeler/
+veriseti_2026/
+*.pdf

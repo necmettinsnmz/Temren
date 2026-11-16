@@ -2,7 +2,28 @@ import os
 import numpy as np
 from utils.logger import log
 
-def parse_calibration_file(file_path):
+DEFAULT_CALIBRATION_PATHS = (
+    os.path.join("data", "Kamera_Kalibrasyon_Parametreleri_2026.txt"),
+    os.path.join("veriseti_2026", "THYZ_2026_Ornek_Veri_Seti", "Kamera_Kalibrasyon_Parametreleri_2026.txt"),
+)
+
+
+def resolve_calibration_path(file_path=None):
+    """Varsayılan kalibrasyon dosyası yollarını sırayla kontrol eder."""
+    if file_path is not None:
+        return file_path
+
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for candidate in DEFAULT_CALIBRATION_PATHS:
+        if os.path.exists(candidate):
+            return candidate
+        abs_candidate = os.path.join(base_dir, candidate)
+        if os.path.exists(abs_candidate):
+            return abs_candidate
+    return DEFAULT_CALIBRATION_PATHS[0]
+
+
+def parse_calibration_file(file_path=None):
     """
     Kamera_Kalibrasyon_Parametreleri_2026.txt dosyasını parse eder.
     
@@ -16,15 +37,16 @@ def parse_calibration_file(file_path):
         "RGB 1080p": { ... }
     }
     """
-    if not os.path.exists(file_path):
-        log.error(f"Kalibrasyon dosyası bulunamadı: {file_path}")
+    resolved_path = resolve_calibration_path(file_path)
+    if not os.path.exists(resolved_path):
+        log.error(f"Kalibrasyon dosyası bulunamadı: {resolved_path}")
         return None
 
     cameras = {}
     current_cam = None
 
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(resolved_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
             
             for line in lines:
@@ -100,8 +122,7 @@ def parse_calibration_file(file_path):
 
 if __name__ == "__main__":
     # Test
-    calib_path = "../veriseti_2026/THYZ_2026_Ornek_Veri_Seti/Kamera_Kalibrasyon_Parametreleri_2026.txt"
-    res = parse_calibration_file(calib_path)
+    res = parse_calibration_file()
     if res:
         print("1080p K Matrisi:")
         print(res.get("RGB 1080p", {}).get("K"))
