@@ -1,21 +1,21 @@
-import sys
-import os
-os.environ["PYTHONIOENCODING"] = "utf-8"
 """
 Görev 3 Benchmark ve Test Scripti
 
 Bu script:
 1. İnternetten örnek görüntüler indirir
-2. Sentetik referans obje/frame çiftleri oluşturur (crop + transform)  
+2. Sentetik referans obje/frame çiftleri oluşturur (crop + transform)
 3. Pipeline'ı çalıştırıp IoU skorunu ölçer
 4. FPS performansını raporlar
 5. Farklı zorluk seviyelerinde (ölçek, rotasyon, aydınlatma) test eder
 """
 
+import os
+
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
 import cv2
 import numpy as np
 import time
-import os
 import urllib.request
 from tasks.task3_matching import ImageMatcher
 from utils.logger import log

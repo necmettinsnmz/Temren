@@ -1,6 +1,7 @@
 import cv2
 import time
 import os
+from config import TRACKER_REDETECTION_INTERVAL
 from tasks.task3_matching import ImageMatcher
 from utils.logger import log
 
@@ -44,7 +45,7 @@ def run_video_test(video_path, ref_image_path, output_path="output_video.mp4"):
         frame_count += 1
         
         start_time = time.time()
-        # Modeli çalıştır (İlk karelerde LightGlue, sonrasında CSRT Tracker çalışacak)
+        # Modeli çalıştır (Tespit karelerinde DINOv2+LoFTR, ara karelerde CSRT Tracker çalışır)
         detections = matcher.run(frame, reference_objects=ref_objects)
         elapsed_time = time.time() - start_time
         total_processing_time += elapsed_time
@@ -61,9 +62,12 @@ def run_video_test(video_path, ref_image_path, output_path="output_video.mp4"):
             # Takip kutusu
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
             
-            # Model durumunu (LightGlue mu Tracker mı?) yazdırma
-            # matcher.frame_count üzerinden hangi fazda olduğumuzu anlarız
-            status_text = "LightGlue (Tespit)" if (matcher.frame_count - 1) % 15 == 0 else "CSRT (Takip)"
+            # Model durumunu (DINOv2+LoFTR mı Tracker mı?) yazdırma
+            is_detect_frame = (
+                frame_count == 1
+                or (matcher.frame_count + 3) % TRACKER_REDETECTION_INTERVAL == 0
+            )
+            status_text = "DINOv2+LoFTR (Tespit)" if is_detect_frame else "CSRT (Takip)"
             cv2.putText(frame, f"Durum: {status_text}", (x1, y1 - 10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         else:

@@ -1,28 +1,20 @@
 """
-Görev 3: Görüntü Eşleme — DINOv2 + LoFTR Hibrit Mimari (v2 — Temiz Yeniden Yazım)
+Görev 3: Görüntü Eşleme — DINOv2 + LoFTR Hibrit Mimari
 
 Pipeline:
-  1. DINOv2 ile kaba konum tespiti (Coarse Localization)
-     - Referans görselin "anlamsal parmak izi"ni (patch token ortalaması) çıkar
-     - Video karesini yama (patch) bazlı tara, en benzer bölgeleri bul
-     - Multi-scale aday bölgeler oluştur
+  1. DINOv2 ile Kaba Konum Tespiti (Coarse Localization)
+     - Referans görselin anlamsal parmak izini (patch token ortalaması) çıkarır
+     - Video karesini yama (patch) bazlı tarayarak en benzer aday merkezleri bulur
+     - Çok ölçekli (multi-scale) aday kırpma bölgeleri oluşturur
 
-  2. LoFTR ile hassas eşleştirme (Fine Matching)
-     - Her aday bölgede yoğun piksel eşleştirmesi yap
-     - Homografi + RANSAC ile geometrik doğrulama
-     - verify_homography ile saçma kutuları reddet
-     - Hassas bounding box çıkar
+  2. LoFTR ile Hassas Eşleştirme (Fine Matching)
+     - Her aday bölgede yoğun piksel eşleştirmesi yapar
+     - Homografi + RANSAC + verify_homography ile geometrik doğrulama uygular
+     - Hatalı eşleşmeleri reddederek yalnızca doğrulanmış bounding box üretir
 
-  3. CSRT Tracker ile kare-arası takip
-     - Obje bulunduğunda, sonraki karelerde hızlıca takip et
-     - Periyodik olarak DINOv2+LoFTR ile tekrar doğrula
-
-Önceki sürümün sorunları (v1):
-  - DINOv2 fallback: LoFTR başarısız olduğunda bile kutu döndürüyordu → çöp tespiti
-  - Aday bölge boyutu çok küçüktü → gerçek objeleri kaçırıyordu
-  - LoFTR güven eşiği çok yüksekti → hiç eşleşme bulamıyordu
-  - CLAHE preprocessing uygulanmıyordu
-  - verify_homography kullanılmıyordu
+  3. CSRT Tracker ile Kare-Arası Takip
+     - Tespit edilen nesneleri sonraki karelerde hızlı biçimde takip eder
+     - Belirlenen aralıklarla (TRACKER_REDETECTION_INTERVAL) yeniden doğrular
 """
 
 import cv2
@@ -47,16 +39,20 @@ from utils.preprocessing import enhance_image, verify_homography
 
 class ImageMatcher:
     """
-    Görüntü Eşleme modülü — DINOv2 + LoFTR Hibrit Mimari (v2).
+    Görüntü Eşleme modülü — DINOv2 + LoFTR Hibrit Mimari.
 
     Yarışma arayüzü (TEAM_INTERFACE) ile tam uyumlu:
-      - __init__(): Model yükleme
+      - __init__(device=None): Model yükleme
       - run(frame, reference_objects): Her kare için çağrılır, JSON-uyumlu list döner
     """
 
-    def __init__(self):
+    def __init__(self, device=None):
         log.info("Görev 3 (Görüntü Eşleme) modülü başlatılıyor...")
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if device is not None:
+            resolved_device = "cpu" if (device == "cuda" and not torch.cuda.is_available()) else device
+            self.device = torch.device(resolved_device)
+        else:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         log.info(f"Cihaz: {self.device}")
 
         # Takipçi (Tracker) durumları ve önbellek
