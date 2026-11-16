@@ -33,7 +33,13 @@ def main():
 
         # 3. Görevleri Çalıştırma
         detected_objects = task1.run(current_frame)
-        detected_translations = task2.run(current_frame)
+        detected_translations = task2.run(
+            current_frame,
+            health_status=telemetry.get("health_status", 0),
+            translation_x=telemetry.get("translation_x"),
+            translation_y=telemetry.get("translation_y"),
+            translation_z=telemetry.get("translation_z"),
+        )
         # Referans objeler sunucudan veya başka yerden gelebilir, şimdilik None geçiyoruz
         detected_undefined_objects = task3.run(current_frame, reference_objects=None)
 

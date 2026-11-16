@@ -3,18 +3,28 @@ SERVER_URL = "http://127.0.0.25:5000"
 USER_URL = "http://localhost/users/1/"  # Kendi takımınızın ID'sine göre güncellenecektir.
 API_ENDPOINT_RESULTS = f"{SERVER_URL}/api/submit"  # Örnek API ucu, yarışma günü kesinleşecek.
 
-# Görüntü Çözünürlüğü ve Parametreleri
+# Görüntü Çözünürlüğü ve Kamera Kalibrasyon Ayarları
 FRAME_WIDTH = 1920
 FRAME_HEIGHT = 1080
+CALIBRATION_FILE_PATH = "data/Kamera_Kalibrasyon_Parametreleri_2026.txt"
+DEFAULT_CAMERA_TYPE = "RGB 1080p"
 
-# Görev 1 (Nesne Tespiti) Ayarları
-# Örnek: YOLOv8 vb. ağırlık yolları eklenebilir.
-TASK1_MODEL_PATH = "models/yolov8_custom.pt"
-CONFIDENCE_THRESHOLD = 0.5
+# Görev 1 (Nesne Tespiti) Ayarları — YOLOv8 + SAHI + Optik Akış
+TASK1_MODEL_PATH = "models/yolov8s_temren.pt"
+CONFIDENCE_THRESHOLD = 0.45
+IOU_NMS_THRESHOLD = 0.45
+USE_SAHI_SLICING = False
+SAHI_SLICE_SIZE = 640
+SAHI_OVERLAP_RATIO = 0.2
+MOTION_FLOW_THRESHOLD = 1.8
+LANDING_IOU_THRESHOLD = 0.05
 
-# Görev 2 (Pozisyon Tespiti) Ayarları
-# Optik akış veya diğer parametreler
-FEATURE_PARAMS = dict(maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
+# Görev 2 (Pozisyon Kestirimi) Ayarları — ORB Görsel Odometri + Kalman Filtresi
+ORB_MAX_FEATURES = 1500
+LOWE_RATIO_THRESHOLD = 0.75
+BLUR_LAPLACIAN_THRESHOLD = 45.0
+DEFAULT_FLIGHT_ALTITUDE = 50.0
+FEATURE_PARAMS = dict(maxCorners=200, qualityLevel=0.01, minDistance=7, blockSize=7)
 
 # Görev 3 (Görüntü Eşleme) Ayarları — DINOv2 + LoFTR Hibrit Mimari
 DINOV2_MODEL_NAME = "dinov2_vits14"        # En küçük ve hızlı DINOv2 modeli
